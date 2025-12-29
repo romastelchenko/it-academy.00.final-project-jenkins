@@ -1,11 +1,349 @@
-pipeline {
-    agent any
+def stageDurations = [:]
+def stageOrder = [
+  'Deploy',
+  'Wait For Ready',
+  'Test',
+  'Keep Deploy Or Rollback',
+  'Rollback',
+  'Wait After Rollback',
+  'Test After Rollback'
+]
 
-    stages {
-        stage('Hello') {
-            steps {
-                echo 'Hello World'
+def STATUS_EMOJI = [
+  'FAILED_TESTS': '🔴',
+  'ROLLBACK': '🟡',
+  'SUCCESS': '🟢',
+  'FAILURE': '🔴',
+  'UNSTABLE': '🟡',
+  'ABORTED': '🟡',
+  'NOT_RUN': '⚪',
+  'n/a': '⚪'
+]
+
+@NonCPS
+String formatStatusLine(String label, String status, Map emojiMap) {
+  def icon = emojiMap.get(status ?: 'n/a', '🟡')
+  return "*${label}:* ${icon} ${status ?: 'n/a'}"
+}
+
+def runTests(Map stageDurations, String stageName) {
+  def stageStart = System.currentTimeMillis()
+  def status = sh(
+    script: 'set -euo pipefail\nexport API_URL="http://${HELM_NAMESPACE}.k8s-13.sa/api/v1"\n/scripts/cd_smoke.sh',
+    returnStatus: true
+  )
+  if (status != 0) {
+    env.TEST_FAILED = 'true'
+    currentBuild.result = 'UNSTABLE'
+  }
+  stageDurations[stageName] = System.currentTimeMillis() - stageStart
+  return status
+}
+
+def waitForReady(Map stageDurations, String stageName, String namespace, String timeoutSeconds) {
+  def stageStart = System.currentTimeMillis()
+  def waitEnv = [
+    "HELM_NAMESPACE=${namespace}",
+    "WAIT_TIMEOUT_SECONDS=${timeoutSeconds}"
+  ]
+  withEnv(waitEnv) {
+    sh '''
+      set -euo pipefail
+      for kind in deployment statefulset daemonset; do
+        resources="$(kubectl get "$kind" --namespace "$HELM_NAMESPACE" -o name)"
+        if [ -n "$resources" ]; then
+          echo "$resources" | xargs -r kubectl rollout status --namespace "$HELM_NAMESPACE" --timeout "${WAIT_TIMEOUT_SECONDS}s"
+        fi
+      done
+    '''
+  }
+  stageDurations[stageName] = System.currentTimeMillis() - stageStart
+}
+
+def slackNotify(String message){
+    def notify_head = "----------------------\n*CD from Job:* ${env.JOB_NAME} #${env.BUILD_NUMBER}\n*URL:* ${env.BUILD_URL}\n"
+
+    def notify_message = notify_head + message
+    slackSend(channel: '#itacademy-final-project-cd', message: notify_message)
+}
+
+@NonCPS
+String formatDuration(long ms) {
+  if (ms <= 0) {
+    return '0s'
+  }
+  long seconds = (long) (ms / 1000)
+  long minutes = (long) (seconds / 60)
+  long hours = (long) (minutes / 60)
+  seconds = seconds % 60
+  minutes = minutes % 60
+  if (hours > 0) {
+    return String.format('%dh %dm %ds', hours, minutes, seconds)
+  }
+  if (minutes > 0) {
+    return String.format('%dm %ds', minutes, seconds)
+  }
+  return String.format('%ds', seconds)
+}
+
+pipeline {
+  agent { label 'docker && k8s' }
+
+  parameters {
+    string(
+      name: 'HELM_NAMESPACE',
+      defaultValue: 'footbal-app-test-v2',
+      description: 'Kubernetes namespace for the release.'
+    )
+    string(
+      name: 'HELM_CHART_VERSION',
+      defaultValue: '',
+      description: 'Optional chart version to install.'
+    )
+    string(
+      name: 'HELM_SET_OVERRIDES',
+      defaultValue: '',
+      description: 'Optional Helm --set-string overrides (comma-separated key=value pairs).'
+    )
+  }
+
+  environment {
+    HELM_RELEASE = 'footbal-app-by-helm'
+    HELM_REPO_NAME = 'it-academy.00.final-project-helm'
+    HELM_REPO_URL = 'https://romastelchenko.github.io/it-academy.00.final-project-helm/helm-releases'
+    HELM_CHART = 'football-app'
+    WAIT_TIMEOUT_SECONDS = '600'
+  }
+
+  stages {
+    stage('Deploy') {
+      steps {
+        script {
+          def stageStart = System.currentTimeMillis()
+          def helmEnv = [
+            "HELM_NAMESPACE=${params.HELM_NAMESPACE}",
+            "HELM_CHART_VERSION=${params.HELM_CHART_VERSION}",
+            "HELM_SET_OVERRIDES=${params.HELM_SET_OVERRIDES}"
+          ]
+          withEnv(helmEnv) {
+            sh '''
+              set -euo pipefail
+              helm repo add "$HELM_REPO_NAME" "$HELM_REPO_URL"
+              helm repo update
+            '''
+            def versionInfo = sh(
+              script: '''
+                set -euo pipefail
+                history_line="$(helm history "$HELM_RELEASE" --namespace "$HELM_NAMESPACE" --max 1 2>/dev/null | awk -F "\\t" 'NR==2 {print $4 "|" $5}' || true)"
+                current_chart="n/a"
+                current_app="n/a"
+                if [ -n "$history_line" ]; then
+                  current_chart="$(echo "$history_line" | cut -d'|' -f1)"
+                  current_app="$(echo "$history_line" | cut -d'|' -f2)"
+                fi
+                if [ -n "${HELM_CHART_VERSION:-}" ]; then
+                  desired_chart="$HELM_CHART_VERSION"
+                  desired_app="$(helm show chart "$HELM_REPO_NAME/$HELM_CHART" --version "$HELM_CHART_VERSION" | awk -F ': ' '/^appVersion:/ {print $2}')"
+                else
+                  desired_chart="$(helm search repo "$HELM_REPO_NAME/$HELM_CHART" --versions | awk 'NR==2 {print $2}')"
+                  desired_app="$(helm search repo "$HELM_REPO_NAME/$HELM_CHART" --versions | awk 'NR==2 {print $3}')"
+                fi
+                if [ -z "$desired_chart" ]; then desired_chart="n/a"; fi
+                if [ -z "$desired_app" ]; then desired_app="n/a"; fi
+                printf '%s|%s|%s|%s\n' "$current_chart" "$current_app" "$desired_chart" "$desired_app"
+              ''',
+              returnStdout: true
+            ).trim()
+            def parts = versionInfo.split('\\|', -1)
+            if (parts.size() >= 4) {
+              env.DEPLOY_FROM_CHART = parts[0] ?: 'n/a'
+              env.DEPLOY_FROM_APP = parts[1] ?: 'n/a'
+              env.DEPLOY_TO_CHART = parts[2] ?: 'n/a'
+              env.DEPLOY_TO_APP = parts[3] ?: 'n/a'
             }
+            sh '''
+              set -euo pipefail
+              if [ -n "${HELM_SET_OVERRIDES:-}" ]; then
+                if [ -n "${HELM_CHART_VERSION:-}" ]; then
+                  helm upgrade --install "$HELM_RELEASE" "$HELM_REPO_NAME/$HELM_CHART" \
+                    --namespace "$HELM_NAMESPACE" --create-namespace \
+                    --set-string "$HELM_SET_OVERRIDES" \
+                    --version "$HELM_CHART_VERSION"
+                else
+                  helm upgrade --install "$HELM_RELEASE" "$HELM_REPO_NAME/$HELM_CHART" \
+                    --namespace "$HELM_NAMESPACE" --create-namespace \
+                    --set-string "$HELM_SET_OVERRIDES"
+                fi
+              else
+                if [ -n "${HELM_CHART_VERSION:-}" ]; then
+                  helm upgrade --install "$HELM_RELEASE" "$HELM_REPO_NAME/$HELM_CHART" \
+                    --namespace "$HELM_NAMESPACE" --create-namespace \
+                    --version "$HELM_CHART_VERSION"
+                else
+                  helm upgrade --install "$HELM_RELEASE" "$HELM_REPO_NAME/$HELM_CHART" \
+                    --namespace "$HELM_NAMESPACE" --create-namespace
+                fi
+              fi
+            '''
+          }
+          stageDurations['Deploy'] = System.currentTimeMillis() - stageStart
         }
+      }
     }
+
+    stage('Wait For Ready') {
+      steps {
+        script {
+          waitForReady(stageDurations, 'Wait For Ready', params.HELM_NAMESPACE, env.WAIT_TIMEOUT_SECONDS)
+        }
+      }
+    }
+
+    stage('Test') {
+      steps {
+        script {
+          def status = runTests(stageDurations, 'Test')
+          env.TEST_AFTER_DEPLOY = status == 0 ? 'SUCCESS' : 'FAILURE'
+        }
+      }
+    }
+
+    stage('Keep Deploy Or Rollback') {
+      steps {
+        script {
+          def stageStart = System.currentTimeMillis()
+          def action = 'keep'
+          if (env.TEST_FAILED == 'true') {
+            def prevRev = sh(
+              script: '''
+                set -euo pipefail
+                revs="$(helm history "$HELM_RELEASE" --namespace "$HELM_NAMESPACE" | awk 'NR>1 {print $1}' | sort -n)"
+                current_rev="$(echo "$revs" | tail -n 1)"
+                prev_rev="$(echo "$revs" | tail -n 2 | head -n 1)"
+                if [ -z "$prev_rev" ] || [ "$prev_rev" = "$current_rev" ]; then
+                  echo ""
+                else
+                  echo "$prev_rev"
+                fi
+              ''',
+              returnStdout: true
+            ).trim()
+            if (!prevRev) {
+              echo 'No previous revision found; rollback is not available.'
+              action = 'keep'
+            } else {
+              def prompt = """Tests after deployment failed.
+Keep the deployment or roll back to the previous version?
+Current: ${env.DEPLOY_TO_CHART ?: 'n/a'} (${env.DEPLOY_TO_APP ?: 'n/a'})
+Previous: ${env.DEPLOY_FROM_CHART ?: 'n/a'} (${env.DEPLOY_FROM_APP ?: 'n/a'})
+"""
+              slackNotify(prompt)
+
+              action = input(
+                message: prompt,
+                parameters: [
+                  choice(
+                    name: 'action',
+                    choices: ['keep', 'rollback'],
+                    description: 'Select the desired action.'
+                  )
+                ]
+              )
+            }
+          }
+          env.DEPLOY_ACTION = action
+          stageDurations['Keep Deploy Or Rollback'] = System.currentTimeMillis() - stageStart
+        }
+      }
+    }
+
+    stage('Rollback') {
+      when {
+        expression { env.DEPLOY_ACTION == 'rollback' }
+      }
+      steps {
+        script {
+          def stageStart = System.currentTimeMillis()
+          def helmEnv = [
+            "HELM_RELEASE=${env.HELM_RELEASE}",
+            "HELM_NAMESPACE=${params.HELM_NAMESPACE}"
+          ]
+          withEnv(helmEnv) {
+            sh '''
+              set -euo pipefail
+              revs="$(helm history "$HELM_RELEASE" --namespace "$HELM_NAMESPACE" | awk 'NR>1 {print $1}' | sort -n)"
+              current_rev="$(echo "$revs" | tail -n 1)"
+              prev_rev="$(echo "$revs" | tail -n 2 | head -n 1)"
+              if [ -z "$prev_rev" ] || [ "$prev_rev" = "$current_rev" ]; then
+                echo "No previous revision found for $HELM_RELEASE"
+                exit 0
+              fi
+              helm rollback "$HELM_RELEASE" "$prev_rev" --namespace "$HELM_NAMESPACE"
+            '''
+          }
+          stageDurations['Rollback'] = System.currentTimeMillis() - stageStart
+        }
+      }
+    }
+
+    stage('Wait After Rollback') {
+      when {
+        expression { env.DEPLOY_ACTION == 'rollback' }
+      }
+      steps {
+        script {
+          waitForReady(stageDurations, 'Wait After Rollback', params.HELM_NAMESPACE, env.WAIT_TIMEOUT_SECONDS)
+        }
+      }
+    }
+
+    stage('Test After Rollback') {
+      when {
+        expression { env.DEPLOY_ACTION == 'rollback' }
+      }
+      steps {
+        script {
+          def status = runTests(stageDurations, 'Test After Rollback')
+          env.TEST_AFTER_ROLLBACK = status == 0 ? 'SUCCESS' : 'FAILURE'
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        def durationLines = stageOrder.collect { stageName ->
+          def duration = stageDurations.get(stageName)
+          if (duration == null) {
+            return null
+          }
+          "${stageName}: ${formatDuration(duration as long)}"
+        }.findAll { it != null }.join('\n')
+        def overall = currentBuild.durationString
+        def action = env.DEPLOY_ACTION ?: 'n/a'
+        def testFailed = env.TEST_FAILED == 'true' ? 'yes' : 'no'
+        def deploymentStatus = 'SUCCESS'
+        if (action == 'rollback') {
+          deploymentStatus = 'ROLLBACK'
+        } else if (testFailed == 'yes') {
+          deploymentStatus = 'FAILED_TESTS'
+        }
+        def resultValue = currentBuild.currentResult
+        def testAfterDeploy = env.TEST_AFTER_DEPLOY ?: 'NOT_RUN'
+        def testAfterRollback = env.TEST_AFTER_ROLLBACK ?: 'NOT_RUN'
+        def message = """*Namespace:* ${params.HELM_NAMESPACE}
+*Update(from-to):* ${env.DEPLOY_FROM_CHART ?: 'n/a'} (${env.DEPLOY_FROM_APP ?: 'n/a'}) -> ${env.DEPLOY_TO_CHART ?: 'n/a'} (${env.DEPLOY_TO_APP ?: 'n/a'})
+${formatStatusLine('Build Status', resultValue, STATUS_EMOJI)}
+${formatStatusLine('Deployment status', deploymentStatus, STATUS_EMOJI)}
+${formatStatusLine('Tests after deploy', testAfterDeploy, STATUS_EMOJI)}
+${formatStatusLine('Tests after rollback', testAfterRollback, STATUS_EMOJI)}
+
+*Total duration:* ${overall}
+*Stage durations:*
+${durationLines}"""
+        slackNotify(message)
+      }
+    }
+  }
 }
