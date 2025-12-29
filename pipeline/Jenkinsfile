@@ -26,12 +26,17 @@ String formatStatusLine(String label, String status, Map emojiMap) {
   return "*${label}:* ${icon} ${status ?: 'n/a'}"
 }
 
-def runTests(Map stageDurations, String stageName) {
+def runTests(Map stageDurations, String stageName, String namespace) {
   def stageStart = System.currentTimeMillis()
-  def status = sh(
-    script: 'set -euo pipefail\nexport API_URL="http://${HELM_NAMESPACE}.k8s-13.sa/api/v1"\n/scripts/cd_smoke.sh',
-    returnStatus: true
-  )
+  def testEnv = [
+    "HELM_NAMESPACE=${namespace}"
+  ]
+  def status = withEnv(testEnv) {
+    sh(
+      script: 'set -euo pipefail\nexport API_URL="http://${HELM_NAMESPACE}.k8s-13.sa/api/v1"\nscripts/cd_smoke.sh',
+      returnStatus: true
+    )
+  }
   if (status != 0) {
     env.TEST_FAILED = 'true'
     currentBuild.result = 'UNSTABLE'
@@ -202,7 +207,7 @@ pipeline {
     stage('Test') {
       steps {
         script {
-          def status = runTests(stageDurations, 'Test')
+          def status = runTests(stageDurations, 'Test', params.HELM_NAMESPACE)
           env.TEST_AFTER_DEPLOY = status == 0 ? 'SUCCESS' : 'FAILURE'
         }
       }
@@ -303,7 +308,7 @@ Previous: ${env.DEPLOY_FROM_CHART ?: 'n/a'} (${env.DEPLOY_FROM_APP ?: 'n/a'})
       }
       steps {
         script {
-          def status = runTests(stageDurations, 'Test After Rollback')
+          def status = runTests(stageDurations, 'Test After Rollback', params.HELM_NAMESPACE)
           env.TEST_AFTER_ROLLBACK = status == 0 ? 'SUCCESS' : 'FAILURE'
         }
       }
