@@ -97,7 +97,7 @@ pipeline {
   parameters {
     string(
       name: 'HELM_NAMESPACE',
-      defaultValue: 'footbal-app-test-v2',
+      defaultValue: 'final-project-football-app-prod',
       description: 'Kubernetes namespace for the release.'
     )
     string(
